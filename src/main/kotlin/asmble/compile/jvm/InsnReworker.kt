@@ -107,10 +107,12 @@ open class InsnReworker {
         // guarantee the value will be in the right order if there are
         // multiple for the same index
         var insnsToInject = emptyMap<Int, List<Insn>>()
-        fun injectBeforeLastStackCount(insn: Insn, count: Int) {
+        var injectReasons = emptyMap<Int, List<String>>()
+        fun injectBeforeLastStackCount(insn: Insn, count: Int, reason: String) {
             ctx.trace { "Injecting $insn back $count stack values" }
             fun inject(index: Int) {
                 insnsToInject += index to (insnsToInject[index]?.let { listOf(insn) + it } ?: listOf(insn))
+                injectReasons += index to (injectReasons[index]?.let { listOf(reason) + it } ?: listOf(reason))
             }
             if (count == 0) return inject(stackManips.size)
             var countSoFar = 0
@@ -127,6 +129,29 @@ open class InsnReworker {
             if (!foundUnconditionalJump) throw CompileErr.StackInjectionMismatch(count, insn)
         }
 
+        fun foldBlocks() {
+          // the stack is the same depth as before the block -> remove all stack manips in current block
+          var newStackManips = mutableListOf<Pair<Int, Int>>();
+          var depth = 0;
+          var done = false;
+          for ((amountChanged, insnIndex) in stackManips.asReversed()) {
+              if(done) newStackManips.add(0,Pair(amountChanged,insnIndex));
+              else {
+                if(insns[insnIndex].let { insn -> (
+                    insn is Node.Instr.Block || insn is Node.Instr.Loop ||
+                        insn is Node.Instr.If)}) depth -= 1;
+                if(insns[insnIndex] is Node.Instr.End) depth += 1;
+                if (depth == 0) {
+                  done = true;
+                  newStackManips.add(0,Pair(0,insnIndex))
+                } else {
+                  newStackManips.add(0,Pair(0,insnIndex))
+                }
+              }
+          }
+          stackManips = newStackManips;
+        }
+
         // Go over each insn, determining where to inject
         insns.forEachIndexed { index, insn ->
             // Handle special injection cases
@@ -136,43 +161,46 @@ open class InsnReworker {
                     val inject =
                         if (insn.index < ctx.importFuncs.size) Insn.ImportFuncRefNeededOnStack(insn.index)
                         else Insn.ThisNeededOnStack
-                    injectBeforeLastStackCount(inject, ctx.funcTypeAtIndex(insn.index).params.size)
+                    injectBeforeLastStackCount(inject, ctx.funcTypeAtIndex(insn.index).params.size, "call $insn")
                 }
                 // Indirect calls require "this" before the index
                 is Node.Instr.CallIndirect ->
-                    injectBeforeLastStackCount(Insn.ThisNeededOnStack, 1)
+                    injectBeforeLastStackCount(Insn.ThisNeededOnStack, 1, "indirect call $insn")
                 // Global set requires "this" before the single param
                 is Node.Instr.SetGlobal -> {
                     val inject =
                         if (insn.index < ctx.importGlobals.size) Insn.ImportGlobalSetRefNeededOnStack(insn.index)
                         else Insn.ThisNeededOnStack
-                    injectBeforeLastStackCount(inject, 1)
+                    injectBeforeLastStackCount(inject, 1, "setGlobal $insn")
                 }
                 // Loads require "mem" before the single param
                 is Node.Instr.I32Load, is Node.Instr.I64Load, is Node.Instr.F32Load, is Node.Instr.F64Load,
                 is Node.Instr.I32Load8S, is Node.Instr.I32Load8U, is Node.Instr.I32Load16U, is Node.Instr.I32Load16S,
                 is Node.Instr.I64Load8S, is Node.Instr.I64Load8U, is Node.Instr.I64Load16U, is Node.Instr.I64Load16S,
                 is Node.Instr.I64Load32S, is Node.Instr.I64Load32U ->
-                    injectBeforeLastStackCount(Insn.MemNeededOnStack, 1)
+                    injectBeforeLastStackCount(Insn.MemNeededOnStack, 1, "single param $insn")
                 // Storage requires "mem" before the single param
                 is Node.Instr.I32Store, is Node.Instr.I64Store, is Node.Instr.F32Store, is Node.Instr.F64Store,
                 is Node.Instr.I32Store8, is Node.Instr.I32Store16, is Node.Instr.I64Store8, is Node.Instr.I64Store16,
                 is Node.Instr.I64Store32 ->
-                    injectBeforeLastStackCount(Insn.MemNeededOnStack, 2)
+                    injectBeforeLastStackCount(Insn.MemNeededOnStack, 2, "two param $insn")
                 // Grow memory requires "mem" before the single param
                 is Node.Instr.GrowMemory ->
-                    injectBeforeLastStackCount(Insn.MemNeededOnStack, 1)
+                    injectBeforeLastStackCount(Insn.MemNeededOnStack, 1, "grow memory")
                 else -> { }
             }
 
             // Add the current diff
             ctx.trace { "Stack diff is ${insnStackDiff(ctx, insn)} for $insn" }
             stackManips += insnStackDiff(ctx, insn) to index
+            if(insn is Node.Instr.End) foldBlocks();
         }
 
         // Build resulting list
         return insns.foldIndexed(emptyList<Insn>()) { index, ret, insn ->
             val injections = insnsToInject[index] ?: emptyList()
+            var reasons = injectReasons[index] ?: emptyList()
+            ctx.trace { "Injecting before $insn: $injections $reasons" }
             ret + injections + Insn.Node(insn)
         }
     }
